@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: Apache-2.0
+# Board layer: Waveshare ESP32-P4-Module-DEV-KIT (ESP32-P4-Module + on-board C6).
+# Layered LAST (see CMakeLists.txt) so it overrides nn-app-media's shared
+# sdkconfig.defaults[.esp32p4], which is tuned for the ESP32-P4-WIFI6 board.
+#
+# Everything else — camera (IMX708 2304x1296 -> DIG-CROP 1920x1296), esp-hosted
+# SDIO on the FUNC_BOARD pin set, 16 MB flash, partition table — is IDENTICAL to
+# that board and is inherited unchanged.  Only the SILICON differs.
+
+# ── Pre-3.0 silicon ─────────────────────────────────────────────────────────
+# This kit's module is revision v1.3 (esptool: "ESP32-P4 (revision v1.3)"; its
+# factory image reports "Min chip rev v0.1 / Max chip rev v1.99"), whereas the
+# ESP32-P4-WIFI6 board is production v3.1.  The shared defaults deliberately
+# leave ESP32P4_SELECTS_REV_LESS_V3 UNSET for that v3.1 part; here it must be
+# set, otherwise the image is built rev-min v3.01 and this chip refuses it
+# ("requires chip revision in range [v3.01 - v3.99]").
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# ── PSRAM speed follows from the revision ───────────────────────────────────
+# SPIRAM_SPEED_250M is `depends on !ESP32P4_SELECTS_REV_LESS_V3`, so the shared
+# defaults' 250M becomes unselectable the moment the flag above is set.  State
+# 200M explicitly instead of relying on the silent fallback — and it matches the
+# hardware, which enumerates at exactly that: the boot log reads
+#   hex_psram: density 0x07 (256 Mbit), BitMode 0x01 (X16 Mode)
+#   esp_psram: Found 32MB PSRAM device / Speed: 200MHz
+CONFIG_SPIRAM_SPEED_200M=y
+
+# ── esp-hosted buffers MUST live in PSRAM on this board ─────────────────────
+# nn-app-media's shared defaults deliberately keep esp-hosted's tasks and mempool
+# in INTERNAL RAM (cache-safe stacks).  That fits on the v3.1 WIFI6 board but NOT
+# here: esp-hosted's init runs before the scheduler and consumed ~437 KB of
+# internal RAM, so FreeRTOS then could not allocate the 1536-byte IDLE task stack
+# and the board reboot-looped on
+#     assert failed: vApplicationGetIdleTaskMemory port_common.c:53
+# Instrumenting that allocation showed the smoking gun — internal exhausted while
+# PSRAM sat empty:
+#     idle alloc fail: want=1536 int_free=3056 int_big=1152 spi_free=33550924
+# Moving esp-hosted to PSRAM restores a healthy split (internal=446 KB free).
+# NOTE the mechanism is only partly understood: the likely reason the same
+# settings fit on v3.1 is that SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY can place task
+# stacks in PSRAM there, whereas this pre-3.0 part keeps them internal — so these
+# two options just make explicit what v3.1 does implicitly.  If SDIO throughput
+# ever looks poor on this board, suspect these first.
+CONFIG_ESP_HOSTED_DFLT_TASK_FROM_SPIRAM=y
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+
+# ── Known v1.3 silicon limitations (informational, no action) ───────────────
+# * ISP black-level correction is unavailable:
+#     ISP_BLC: BLC is not supported on ESP32P4 chips prior than v3.0
+#   esp_video logs "BLC configure failed — continuing without" and carries on.
+# * CPU tops out at 360 MHz (v3.x parts reach 400 MHz) — IDF derives this.
+# * The on-board C6 reports esp-hosted slave version 0.0.0 against our 2.12.x
+#   host ("Version mismatch ... Upgrade co-proc to avoid RPC timeouts").  The
+#   link negotiates and works; if RPC timeouts appear, reflash the C6 slave.
+
+# ── Wide NoIR colour: WB gains are the LIVE colour control ──────────────────
+# nn_camera_set_wb() builds the ISP CCM as CCM_BASE x per-channel WB gains and
+# that matrix is what the image actually gets — measured 2026-08-02: sweeping
+# the IPA JSON's acc.ccm (row scale x0.82, then sum-preserving R->G shifts up
+# to 25%) moved R/G by <1%, so on this firmware the JSON ccm is inert and the
+# Kconfig gains below are authoritative.  The shared default (R=B=1620 milli,
+# "variant F", tuned on the IR-cut camera) over-reds the NoIR: no IR-cut filter
+# means IR lands in the red channel on top of the 1.62x gain -> measured
+# R/G=1.46, B/G=1.20.  Values below target neutral (~1.0) on the same scene.
+# Re-trimmed 2026-08-03 after nn_camera began disabling the ISP's WB BLOCK (the
+# purple-band culprit — see nn_camera.c capture_task).  That block had been
+# attenuating R/B underneath these gains, so the old values (1280/1600) over-
+# corrected once it was off (measured R/G 1.50, B/G 1.74).  Live-trimmed via
+# `isp wb` back to the user-validated warm-neutral (R/G=B/G≈1.05-1.11).
+CONFIG_NN_CAMERA_WB_R_MILLI=1001
+CONFIG_NN_CAMERA_WB_B_MILLI=1110
